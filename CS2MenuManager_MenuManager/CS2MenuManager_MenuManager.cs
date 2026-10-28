@@ -35,8 +35,23 @@ public class CS2MenuManager_Menu : BasePlugin, IPluginConfig<Config>
         if (@event.Userid is not { } player)
             return HookResult.Continue;
 
-        MenuManager.CloseActiveMenu(player);
+        // osnet: close by slot so cleanup does not depend on reading the leaving player's SteamID.
+        int slot;
+        try { slot = player.Slot; }
+        catch { return HookResult.Continue; }
+
+        MenuManager.CloseMenusForSlot(slot);
         return HookResult.Continue;
+    }
+
+    [ConsoleCommand("css_mm_debug", "osnet: CS2MenuManager live menu / tick listener counts")]
+    public void Command_Debug(CCSPlayerController? player, CommandInfo info)
+    {
+        if (player != null && !AdminManager.PlayerHasPermissions(player, "@css/root"))
+            return;
+
+        string ticks = string.Join(", ", MenuManager.LiveTickCounts.Select(kv => $"slot{kv.Key}={kv.Value}"));
+        info.ReplyToCommand($"[CS2MM.osnet] active menus={MenuManager.ActiveMenuCount} wasd ticks: {(ticks.Length == 0 ? "none" : ticks)}");
     }
 
     public void OnConfigParsed(Config config)

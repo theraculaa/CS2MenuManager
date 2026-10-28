@@ -132,6 +132,54 @@ public abstract class BaseMenuInstance(CCSPlayerController player, IMenu menu) :
     /// </summary>
     public CCSPlayerController Player { get; } = player;
 
+    // osnet: the owner is captured once, at creation. Cleanup never reads SteamID again.
+    internal readonly int OwnerSlot = player.Slot;
+    internal readonly int? OwnerUserId = player.UserId;
+    internal ulong MenuKey { get; set; }
+
+    /// <summary>
+    /// True once the instance has been closed or disposed.
+    /// </summary>
+    public bool IsClosed => _disposed;
+
+    /// <summary>
+    /// True while the captured owner is still the same connected player (same slot and userid).
+    /// A reconnecting player gets a new userid, so a stale instance never matches.
+    /// </summary>
+    internal bool OwnerValid()
+    {
+        try
+        {
+            return Player.IsValid
+                && Player.Connected == PlayerConnectedState.Connected
+                && Player.UserId == OwnerUserId;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Closes the menu without depending on the player's state. Never throws.
+    /// </summary>
+    internal void ForceClose(string reason)
+    {
+        Diag.Info(Menu.Plugin, $"menu force-closed: slot={OwnerSlot} userid={OwnerUserId} reason={reason}");
+        try
+        {
+            Close(false);
+        }
+        catch (Exception ex)
+        {
+            Diag.Warn(Menu.Plugin, $"Close failed during force-close (slot={OwnerSlot}): {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            ((IDisposable)this).Dispose();
+        }
+    }
+
     /// <summary>
     /// Gets or sets the current page number of the menu.
     /// </summary>
@@ -238,7 +286,7 @@ public abstract class BaseMenuInstance(CCSPlayerController player, IMenu menu) :
     /// <param name="key">The key that was pressed.</param>
     public virtual void OnKeyPress(CCSPlayerController player, int key)
     {
-        if (player.Handle != Player.Handle)
+        if (_disposed || player.Handle != Player.Handle)
             return;
 
         switch (key)
@@ -273,6 +321,10 @@ public abstract class BaseMenuInstance(CCSPlayerController player, IMenu menu) :
     internal void HandleSelectAction(ItemOption menuOption)
     {
         menuOption.OnSelect?.Invoke(Player, menuOption);
+
+        // osnet: the callback may have closed this menu (or opened another one); stop touching the player.
+        if (_disposed)
+            return;
 
         switch (menuOption.PostSelectAction)
         {
@@ -329,10 +381,23 @@ public abstract class BaseMenuInstance(CCSPlayerController player, IMenu menu) :
 
     private HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
     {
-        if (@event.Userid != Player)
+        // osnet: match by the captured slot; never depend on the leaving player's SteamID or pawn.
+        int slot;
+        try
+        {
+            if (@event.Userid is not { } leaving)
+                return HookResult.Continue;
+            slot = leaving.Slot;
+        }
+        catch
+        {
+            return HookResult.Continue;
+        }
+
+        if (slot != OwnerSlot || _disposed)
             return HookResult.Continue;
 
-        Close(false);
+        ForceClose("player disconnect");
         return HookResult.Continue;
     }
 
@@ -350,13 +415,20 @@ public abstract class BaseMenuInstance(CCSPlayerController player, IMenu menu) :
         if (_disposed)
             return;
 
+        // osnet: mark first so a re-entrant call (or the same tick) cannot touch the player again,
+        // and run every cleanup step even if an earlier one throws.
+        _disposed = true;
+
         if (disposing)
         {
-            DeregisterOnKeyPress();
-            DeregisterPlayerDisconnectEvent();
-            MenuManager.DisposeActiveMenu(Player);
-        }
+            try { DeregisterOnKeyPress(); }
+            catch (Exception ex) { Diag.Warn(Menu.Plugin, $"DeregisterOnKeyPress failed: {ex.Message}"); }
 
-        _disposed = true;
+            try { DeregisterPlayerDisconnectEvent(); }
+            catch (Exception ex) { Diag.Warn(Menu.Plugin, $"DeregisterPlayerDisconnectEvent failed: {ex.Message}"); }
+
+            try { MenuManager.DisposeActiveMenu(this); }
+            catch (Exception ex) { Diag.Warn(Menu.Plugin, $"DisposeActiveMenu failed: {ex.Message}"); }
+        }
     }
 }

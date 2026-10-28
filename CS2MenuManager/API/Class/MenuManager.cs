@@ -13,6 +13,13 @@ public static class MenuManager
 {
     private static readonly Dictionary<ulong, (IMenuInstance Instance, Timer? Timer)> ActiveMenus = [];
 
+    // osnet: only the latest OpenMenu call per player may create an instance on the next frame.
+    private static readonly Dictionary<ulong, (long Token, int Slot)> PendingOpens = [];
+    private static long _openSequence;
+
+    // osnet: live WASD tick listeners per slot, to prove that menus do not pile up on one player.
+    private static readonly Dictionary<int, int> LiveTicks = [];
+
     /// <summary>
     /// A static readonly dictionary that maps menu type names to their corresponding <see cref="Type"/> objects.
     /// </summary>
@@ -25,13 +32,63 @@ public static class MenuManager
     };
 
     /// <summary>
+    /// osnet: the dictionary key for a player. Bots all have SteamID 0, so they are keyed by slot instead.
+    /// Only read while the player is known to be valid; cleanup uses the key stored on the instance.
+    /// </summary>
+    private static bool TryKey(CCSPlayerController? player, out ulong key)
+    {
+        key = 0;
+        try
+        {
+            if (player is null || !player.IsValid)
+                return false;
+
+            ulong steamId = player.SteamID;
+            key = steamId != 0 ? steamId : (1UL << 63) | (uint)player.Slot;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Gets the active menu for the specified player.
     /// </summary>
     /// <param name="player">The player controller.</param>
     /// <returns>The active menu instance, or null if no menu is active.</returns>
     public static IMenuInstance? GetActiveMenu(CCSPlayerController player)
     {
-        return ActiveMenus.TryGetValue(player.SteamID, out (IMenuInstance Instance, Timer? Timer) value) ? value.Instance : null;
+        if (!TryKey(player, out ulong key) || !ActiveMenus.TryGetValue(key, out (IMenuInstance Instance, Timer? Timer) value))
+            return null;
+
+        // osnet: a menu that belonged to an earlier connection of this player is never handed back.
+        if (value.Instance is BaseMenuInstance baseInstance && (baseInstance.IsClosed || !baseInstance.OwnerValid() || baseInstance.OwnerUserId != SafeUserId(player)))
+        {
+            RemoveEntry(key, value.Instance);
+            baseInstance.ForceClose("stale menu found for a new connection");
+            return null;
+        }
+
+        return value.Instance;
+    }
+
+    private static int? SafeUserId(CCSPlayerController player)
+    {
+        try { return player.UserId; }
+        catch { return null; }
+    }
+
+    private static void RemoveEntry(ulong key, IMenuInstance instance)
+    {
+        if (!ActiveMenus.TryGetValue(key, out (IMenuInstance Instance, Timer? Timer) value) || !ReferenceEquals(value.Instance, instance))
+            return;
+
+        try { value.Timer?.Kill(); }
+        catch { /* timer already gone */ }
+
+        ActiveMenus.Remove(key);
     }
 
     /// <summary>
@@ -40,24 +97,85 @@ public static class MenuManager
     /// <param name="player">The player controller.</param>
     public static void CloseActiveMenu(CCSPlayerController player)
     {
-        if (!ActiveMenus.TryGetValue(player.SteamID, out (IMenuInstance Instance, Timer? Timer) value))
+        if (!TryKey(player, out ulong key))
             return;
 
-        value.Instance.Close(true);
-        value.Timer?.Kill();
-        value.Timer = null;
-        ActiveMenus.Remove(player.SteamID);
+        PendingOpens.Remove(key);
+        CloseByKey(key);
     }
 
-    internal static void DisposeActiveMenu(CCSPlayerController player)
+    private static void CloseByKey(ulong key)
     {
-        if (!ActiveMenus.TryGetValue(player.SteamID, out (IMenuInstance Instance, Timer? Timer) value))
+        if (!ActiveMenus.TryGetValue(key, out (IMenuInstance Instance, Timer? Timer) value))
             return;
 
-        value.Timer?.Kill();
-        value.Timer = null;
-        ActiveMenus.Remove(player.SteamID);
+        // osnet: drop the entry and its timer first, so cleanup never depends on Close() succeeding.
+        RemoveEntry(key, value.Instance);
+
+        try
+        {
+            value.Instance.Close(true);
+        }
+        catch (Exception ex)
+        {
+            if (value.Instance is BaseMenuInstance baseInstance)
+                baseInstance.ForceClose($"Close threw {ex.GetType().Name}");
+        }
     }
+
+    /// <summary>
+    /// osnet: closes every menu and cancels every pending open that belongs to a slot,
+    /// without reading the player's SteamID. Used when a player disconnects.
+    /// </summary>
+    /// <param name="slot">The player slot.</param>
+    public static void CloseMenusForSlot(int slot)
+    {
+        foreach (ulong key in PendingOpens.Where(p => p.Value.Slot == slot).Select(p => p.Key).ToList())
+            PendingOpens.Remove(key);
+
+        List<(ulong Key, IMenuInstance Instance)> owned = ActiveMenus
+            .Where(kv => kv.Value.Instance is BaseMenuInstance b && b.OwnerSlot == slot)
+            .Select(kv => (kv.Key, kv.Value.Instance))
+            .ToList();
+
+        foreach ((ulong key, IMenuInstance instance) in owned)
+        {
+            RemoveEntry(key, instance);
+            if (instance is BaseMenuInstance baseInstance)
+                baseInstance.ForceClose("slot cleanup on disconnect");
+        }
+    }
+
+    internal static void DisposeActiveMenu(BaseMenuInstance instance)
+    {
+        RemoveEntry(instance.MenuKey, instance);
+    }
+
+    internal static void TickAdded(BaseMenuInstance instance)
+    {
+        int slot = instance.OwnerSlot;
+        LiveTicks[slot] = LiveTicks.GetValueOrDefault(slot) + 1;
+        if (LiveTicks[slot] > 1)
+            Diag.Warn(instance.Menu.Plugin, $"slot={slot} has {LiveTicks[slot]} live WASD tick listeners (expected 1)");
+    }
+
+    internal static void TickRemoved(BaseMenuInstance instance)
+    {
+        int slot = instance.OwnerSlot;
+        int left = LiveTicks.GetValueOrDefault(slot) - 1;
+        if (left <= 0) LiveTicks.Remove(slot);
+        else LiveTicks[slot] = left;
+    }
+
+    /// <summary>
+    /// osnet: number of live WASD tick listeners per slot (diagnostics).
+    /// </summary>
+    public static IReadOnlyDictionary<int, int> LiveTickCounts => LiveTicks;
+
+    /// <summary>
+    /// osnet: number of tracked active menus (diagnostics).
+    /// </summary>
+    public static int ActiveMenuCount => ActiveMenus.Count;
 
     /// <summary>
     /// Opens a menu for the specified player.
@@ -76,14 +194,55 @@ public static class MenuManager
             return;
         }
 
+        if (!TryKey(player, out ulong key))
+            return;
+
+        int slot = player.Slot;
+        int? userId = SafeUserId(player);
+
         CloseActiveMenu(player);
+
+        long token = ++_openSequence;
+        if (PendingOpens.ContainsKey(key))
+            Diag.Info(menu.Plugin, $"open superseded before creation: slot={slot}");
+        PendingOpens[key] = (token, slot);
 
         Server.NextFrame(() =>
         {
+            // osnet: a newer open (or a close/disconnect) replaced this one.
+            if (!PendingOpens.TryGetValue(key, out (long Token, int Slot) pending) || pending.Token != token)
+                return;
+            PendingOpens.Remove(key);
+
+            // osnet: the player may have left during the frame (for example kicked while the command ran).
+            bool sameConnection;
+            try
+            {
+                sameConnection = player.IsValid
+                    && player.Connected == PlayerConnectedState.Connected
+                    && player.Slot == slot
+                    && player.UserId == userId;
+            }
+            catch
+            {
+                sameConnection = false;
+            }
+
+            if (!sameConnection)
+            {
+                Diag.Info(menu.Plugin, $"open dropped, player left before the menu was created: slot={slot} userid={userId}");
+                return;
+            }
+
+            // osnet: never let two instances live under one key.
+            CloseByKey(key);
+
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
             IMenuInstance instance = createInstance.Invoke(player, menu);
 
             if (instance is BaseMenuInstance baseMenuInstance)
             {
+                baseMenuInstance.MenuKey = key;
                 baseMenuInstance.RegisterOnKeyPress();
                 baseMenuInstance.RegisterPlayerDisconnectEvent();
 
@@ -103,13 +262,26 @@ public static class MenuManager
                 }
             }
 
+            // osnet: the timer closes this exact instance, never a newer menu opened later.
             Timer? timer = menu.MenuTime > 0 ?
-                menu.Plugin.AddTimer(menu.MenuTime, () => CloseActiveMenu(player)) :
+                menu.Plugin.AddTimer(menu.MenuTime, () =>
+                {
+                    RemoveEntry(key, instance);
+                    try { instance.Close(true); }
+                    catch (Exception ex)
+                    {
+                        if (instance is BaseMenuInstance b) b.ForceClose($"timer close threw {ex.GetType().Name}");
+                    }
+                }) :
                 null;
 
-            ActiveMenus[player.SteamID] = (instance, timer);
+            ActiveMenus[key] = (instance, timer);
 
             instance.Display();
+
+            double ms = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            if (ms >= 5)
+                Diag.Info(menu.Plugin, $"menu created slow: slot={slot} type={instance.GetType().Name} {ms:F1}ms");
         });
     }
 

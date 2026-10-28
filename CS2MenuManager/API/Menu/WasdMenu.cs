@@ -61,6 +61,16 @@ public class WasdMenuInstance : BaseMenuInstance
     private PlayerButtons OldButton;
     private readonly float OldVelocityModifier;
 
+    // osnet: key polling runs every tick, the HTML is only sent when it changed or at a fixed interval.
+    private const float HtmlRefreshSeconds = 0.5f;
+    private const int HtmlDurationSeconds = 2;
+    private bool _tickRegistered;
+    private bool _closing;
+    private bool _htmlDirty = true;
+    private float _nextHtmlAt;
+    private string _lastSentHtml = "";
+    private readonly ulong _stateKey;
+
     /// <summary>
     /// Initializes a new instance of the <see cref="WasdMenuInstance"/> class.
     /// </summary>
@@ -71,7 +81,9 @@ public class WasdMenuInstance : BaseMenuInstance
         if (Menu is not WasdMenu wasdMenu)
             return;
 
-        Menu.Plugin.RegisterListener<OnTick>(OnTick);
+        // osnet: the state key is read once while the player is known to be valid.
+        try { _stateKey = player.SteamID; }
+        catch { _stateKey = 0; }
 
         Buttons = new Dictionary<string, Action>()
         {
@@ -86,6 +98,28 @@ public class WasdMenuInstance : BaseMenuInstance
         
         // Restore previously saved menu state (if exists)
         RestoreMenuState();
+
+        // osnet: register the tick last, after the instance is fully built.
+        Menu.Plugin.RegisterListener<OnTick>(OnTick);
+        _tickRegistered = true;
+        MenuManager.TickAdded(this);
+    }
+
+    private void UnregisterTick()
+    {
+        if (!_tickRegistered)
+            return;
+
+        _tickRegistered = false;
+        try
+        {
+            Menu.Plugin.RemoveListener<OnTick>(OnTick);
+        }
+        catch (Exception ex)
+        {
+            Diag.Warn(Menu.Plugin, $"RemoveListener(OnTick) failed for slot={OwnerSlot}: {ex.Message}");
+        }
+        MenuManager.TickRemoved(this);
     }
 
     /// <summary>
@@ -146,6 +180,8 @@ public class WasdMenuInstance : BaseMenuInstance
         builder.AppendLine(string.Join(" | ", buttomText));
 
         DisplayString = builder.ToString();
+        if (!string.Equals(DisplayString, _lastSentHtml, StringComparison.Ordinal))
+            _htmlDirty = true;
     }
 
     /// <summary>
@@ -153,21 +189,45 @@ public class WasdMenuInstance : BaseMenuInstance
     /// </summary>
     public override void Close(bool exitSound)
     {
-        // Save current menu state before closing
-        SaveMenuState();
-        
-        base.Close(exitSound);
-        Menu.Plugin.RemoveListener<OnTick>(OnTick);
+        if (_closing)
+            return;
+        _closing = true;
 
-        if (Player.IsValid)
+        // osnet: the tick goes first and unconditionally; nothing below may keep it alive.
+        UnregisterTick();
+
+        bool ownerValid = OwnerValid();
+
+        // Save current menu state before closing (only for a still-connected owner; failures are ignored)
+        if (ownerValid)
         {
-            Player.PrintToCenterHtml(" ");
+            try { SaveMenuState(); }
+            catch (Exception ex) { Diag.Warn(Menu.Plugin, $"SaveMenuState failed for slot={OwnerSlot}: {ex.Message}"); }
+        }
 
-            if (((WasdMenu)Menu).WasdMenu_FreezePlayer)
-                Player.Unfreeze(OldVelocityModifier);
+        try
+        {
+            base.Close(exitSound);
+        }
+        finally
+        {
+            if (ownerValid)
+            {
+                try
+                {
+                    Player.PrintToCenterHtml(" ", 1);
 
-            if (exitSound && !string.IsNullOrEmpty(Config.Sound.Exit))
-                Player.ExecuteClientCommand($"play {Config.Sound.Exit}");
+                    if (((WasdMenu)Menu).WasdMenu_FreezePlayer)
+                        Player.Unfreeze(OldVelocityModifier);
+
+                    if (exitSound && !string.IsNullOrEmpty(Config.Sound.Exit))
+                        Player.ExecuteClientCommand($"play {Config.Sound.Exit}");
+                }
+                catch (Exception ex)
+                {
+                    Diag.Warn(Menu.Plugin, $"Close cleanup failed for slot={OwnerSlot}: {ex.Message}");
+                }
+            }
         }
     }
 
@@ -176,7 +236,26 @@ public class WasdMenuInstance : BaseMenuInstance
     /// </summary>
     public void OnTick()
     {
-        PlayerButtons button = Player.Buttons;
+        // osnet: a closed menu never touches the player again, even if the listener fires once more.
+        if (_closing || IsClosed)
+        {
+            UnregisterTick();
+            return;
+        }
+
+        // osnet: the owner left or the controller now belongs to another connection -> full cleanup.
+        if (!OwnerValid())
+        {
+            ForceClose("owner no longer valid on tick");
+            return;
+        }
+
+        // osnet: no pawn yet (still spawning) -> wait, do not read buttons or send HTML.
+        CBasePlayerPawn? pawn = Player.Pawn.Value;
+        if (pawn is null || !pawn.IsValid || pawn.MovementServices is not { } movement)
+            return;
+
+        PlayerButtons button = (PlayerButtons)movement.Buttons.ButtonStates[0];
 
         foreach (KeyValuePair<string, Action> kvp in Buttons)
         {
@@ -190,10 +269,20 @@ public class WasdMenuInstance : BaseMenuInstance
             break;
         }
 
+        // osnet: the key action may have closed this menu or opened another one.
+        if (_closing || IsClosed)
+            return;
+
         OldButton = button;
 
-        if (!string.IsNullOrEmpty(DisplayString))
-            Player.PrintToCenterHtml(DisplayString);
+        float now = Server.CurrentTime;
+        if (!string.IsNullOrEmpty(DisplayString) && (_htmlDirty || now >= _nextHtmlAt))
+        {
+            Player.PrintToCenterHtml(DisplayString, HtmlDurationSeconds);
+            _lastSentHtml = DisplayString;
+            _htmlDirty = false;
+            _nextHtmlAt = now + HtmlRefreshSeconds;
+        }
 
         if (((WasdMenu)Menu).WasdMenu_FreezePlayer)
             Player.Freeze();
@@ -270,13 +359,16 @@ public class WasdMenuInstance : BaseMenuInstance
     private void SaveMenuState()
     {
         // Use a static dictionary to save menu states for each player
-        if (!MenuStateStorage.ContainsKey(Player.SteamID))
+        if (_stateKey == 0)
+            return;
+
+        if (!MenuStateStorage.ContainsKey(_stateKey))
         {
-            MenuStateStorage[Player.SteamID] = new Dictionary<string, MenuState>();
+            MenuStateStorage[_stateKey] = new Dictionary<string, MenuState>();
         }
         
         // Use the menu title as the key to save the state of this menu
-        MenuStateStorage[Player.SteamID][Menu.Title] = new MenuState
+        MenuStateStorage[_stateKey][Menu.Title] = new MenuState
         {
             Page = Page,
             CurrentOffset = CurrentOffset,
@@ -290,10 +382,11 @@ public class WasdMenuInstance : BaseMenuInstance
     /// </summary>
     private void RestoreMenuState()
     {
-        if (MenuStateStorage.ContainsKey(Player.SteamID) && 
-            MenuStateStorage[Player.SteamID].ContainsKey(Menu.Title))
+        if (_stateKey != 0 &&
+            MenuStateStorage.ContainsKey(_stateKey) && 
+            MenuStateStorage[_stateKey].ContainsKey(Menu.Title))
         {
-            MenuState state = MenuStateStorage[Player.SteamID][Menu.Title];
+            MenuState state = MenuStateStorage[_stateKey][Menu.Title];
             Page = state.Page;
             CurrentOffset = state.CurrentOffset;
             CurrentChoiceIndex = state.CurrentChoiceIndex;
@@ -367,9 +460,16 @@ public static class WasdMenuStateManager
     /// </summary>
     private static HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
     {
-        if (@event.Userid != null)
+        try
         {
-            WasdMenuInstance.CleanupPlayerState(@event.Userid.SteamID);
+            if (@event.Userid != null)
+            {
+                WasdMenuInstance.CleanupPlayerState(@event.Userid.SteamID);
+            }
+        }
+        catch
+        {
+            // osnet: state cleanup is best effort; menu cleanup does not depend on it.
         }
         return HookResult.Continue;
     }

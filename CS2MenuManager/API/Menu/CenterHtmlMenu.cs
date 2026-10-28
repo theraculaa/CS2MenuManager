@@ -81,6 +81,19 @@ public class CenterHtmlMenuInstance : BaseMenuInstance
         if (Menu is not CenterHtmlMenu centerHtmlMenu)
             return;
 
+        // osnet: same guard as WasdMenu - a closed menu or a departed owner never touches the player.
+        if (IsClosed)
+        {
+            Menu.Plugin.RemoveListener<OnTick>(Display);
+            return;
+        }
+
+        if (!OwnerValid())
+        {
+            ForceClose("owner no longer valid on tick");
+            return;
+        }
+
         StringBuilder builder = new();
         builder.Append($"<b><font color='{centerHtmlMenu.CenterHtmlMenu_TitleColor}'>{centerHtmlMenu.Title}</font></b><br>");
 
