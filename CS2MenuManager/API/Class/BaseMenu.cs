@@ -165,6 +165,9 @@ public abstract class BaseMenuInstance(CCSPlayerController player, IMenu menu) :
     /// </summary>
     internal void ForceClose(string reason)
     {
+        if (_disposed)
+            return;
+
         Diag.Info(Menu.Plugin, $"menu force-closed: slot={OwnerSlot} userid={OwnerUserId} reason={reason}");
         try
         {
