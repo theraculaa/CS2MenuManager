@@ -61,14 +61,9 @@ public class WasdMenuInstance : BaseMenuInstance
     private PlayerButtons OldButton;
     private readonly float OldVelocityModifier;
 
-    // osnet: key polling runs every tick, the HTML is only sent when it changed or at a fixed interval.
-    private const float HtmlRefreshSeconds = 0.5f;
-    private const int HtmlDurationSeconds = 2;
+    // osnet: the HTML is sent every tick exactly like upstream (a throttled send made the menu flicker in test 0.1).
     private bool _tickRegistered;
     private bool _closing;
-    private bool _htmlDirty = true;
-    private float _nextHtmlAt;
-    private string _lastSentHtml = "";
     private readonly ulong _stateKey;
 
     /// <summary>
@@ -180,8 +175,6 @@ public class WasdMenuInstance : BaseMenuInstance
         builder.AppendLine(string.Join(" | ", buttomText));
 
         DisplayString = builder.ToString();
-        if (!string.Equals(DisplayString, _lastSentHtml, StringComparison.Ordinal))
-            _htmlDirty = true;
     }
 
     /// <summary>
@@ -215,7 +208,7 @@ public class WasdMenuInstance : BaseMenuInstance
             {
                 try
                 {
-                    Player.PrintToCenterHtml(" ", 1);
+                    Player.PrintToCenterHtml(" ");
 
                     if (((WasdMenu)Menu).WasdMenu_FreezePlayer)
                         Player.Unfreeze(OldVelocityModifier);
@@ -275,14 +268,8 @@ public class WasdMenuInstance : BaseMenuInstance
 
         OldButton = button;
 
-        float now = Server.CurrentTime;
-        if (!string.IsNullOrEmpty(DisplayString) && (_htmlDirty || now >= _nextHtmlAt))
-        {
-            Player.PrintToCenterHtml(DisplayString, HtmlDurationSeconds);
-            _lastSentHtml = DisplayString;
-            _htmlDirty = false;
-            _nextHtmlAt = now + HtmlRefreshSeconds;
-        }
+        if (!string.IsNullOrEmpty(DisplayString))
+            Player.PrintToCenterHtml(DisplayString);
 
         if (((WasdMenu)Menu).WasdMenu_FreezePlayer)
             Player.Freeze();
