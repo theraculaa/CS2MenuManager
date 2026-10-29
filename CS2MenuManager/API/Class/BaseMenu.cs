@@ -421,6 +421,7 @@ public abstract class BaseMenuInstance(CCSPlayerController player, IMenu menu) :
         // osnet: mark first so a re-entrant call (or the same tick) cannot touch the player again,
         // and run every cleanup step even if an earlier one throws.
         _disposed = true;
+        Diag.Info(Menu.Plugin, $"menu closed: slot={OwnerSlot}");
 
         if (disposing)
         {

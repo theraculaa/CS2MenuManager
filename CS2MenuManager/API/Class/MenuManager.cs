@@ -280,8 +280,8 @@ public static class MenuManager
             instance.Display();
 
             double ms = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            if (ms >= 5)
-                Diag.Info(menu.Plugin, $"menu created slow: slot={slot} type={instance.GetType().Name} {ms:F1}ms");
+            // osnet: open/close lines let the server log line up menus with the engine's netchan queue warnings.
+            Diag.Info(menu.Plugin, $"menu opened: slot={slot} type={instance.GetType().Name} items={menu.ItemOptions.Count} {ms:F1}ms");
         });
     }
 
